@@ -6,7 +6,7 @@ require('dotenv').config();
 const EXOTEL_SAMPLE_RATE = 8000;
 const OPENAI_SAMPLE_RATE = 24000;
 const AUDIO_TYPE = 'audio/pcm'; 
-const SILENCE_TIMEOUT_MS = 2500; 
+const SILENCE_TIMEOUT_MS = 500;
 const SILENCE_THRESHOLD = 500; 
 // ------------------------------
 
@@ -120,7 +120,6 @@ wss.on('connection', (exotelWs) => {
         }
     );
 
-    openAIWs.audioBuffer = [];
     openAIWs.bytesAppended = 0;
 
     openAIWs.on('open', () => {
@@ -253,7 +252,17 @@ wss.on('connection', (exotelWs) => {
 
         if (data.type === 'response.audio.delta' && data.delta) {
             const chunk = Buffer.from(data.delta, 'base64');
-            openAIWs.audioBuffer.push(chunk);
+            if (exotelWs.readyState === WebSocket.OPEN) {
+                const resampledChunk = resampleAudioChunk(chunk, OPENAI_SAMPLE_RATE, EXOTEL_SAMPLE_RATE);
+                exotelWs.send(JSON.stringify({
+                    event: 'media',
+                    media: {
+                        payload: resampledChunk.toString('base64'),
+                        format: 'pcm16',
+                        sample_rate: EXOTEL_SAMPLE_RATE
+                    }
+                }));
+            }
         }
 
         if (data.type === 'response.transcript') {
@@ -264,26 +273,6 @@ wss.on('connection', (exotelWs) => {
         }
 
         if (data.type === 'response.audio.done') {
-            const fullAudio = Buffer.concat(openAIWs.audioBuffer);
-            openAIWs.audioBuffer = [];
-
-            if (exotelWs.readyState === WebSocket.OPEN && fullAudio.length > 0) {
-                const resampledBack = resampleAudioChunk(
-                    fullAudio,
-                    OPENAI_SAMPLE_RATE,
-                    EXOTEL_SAMPLE_RATE
-                );
-
-                exotelWs.send(JSON.stringify({
-                    event: 'media',
-                    media: {
-                        payload: resampledBack.toString('base64'),
-                        format: 'pcm16',
-                        sample_rate: EXOTEL_SAMPLE_RATE
-                    }
-                }));
-                //console.log(`✅ Sent ${resampledBack.length} bytes to Exotel`);
-            }
             activeResponse = false;
         }
 
