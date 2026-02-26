@@ -1,54 +1,26 @@
 const WebSocket = require('ws');
 const http = require('http');
+const fs = require('fs');
+const path = require('path');
 require('dotenv').config();
 
-// --- Configuration Constants ---
+// --- Fixed Constants ---
 const EXOTEL_SAMPLE_RATE = 8000;
 const OPENAI_SAMPLE_RATE = 24000;
-const AUDIO_TYPE = 'audio/pcm'; 
-const SILENCE_TIMEOUT_MS = 500;
-const SILENCE_THRESHOLD = 500; 
-// ------------------------------
 
-// --- Audio Resampling Function (Linear Interpolation) ---
-function resampleAudioChunk(inputBuffer, inputSampleRate, outputSampleRate) {
-    // ... (resampling function remains unchanged) ...
-    if (inputSampleRate === outputSampleRate) return inputBuffer;
+// Minimum bytes to accumulate before flushing output audio to Exotel.
+// At 8kHz PCM16: 640 bytes ≈ 40ms. Keeps delivery smooth without adding felt latency.
+const MIN_OUT_BYTES = 640;
 
-    const ratio = outputSampleRate / inputSampleRate;
-    const inputSamples = inputBuffer.length / 2;
-    const outputSamples = Math.floor(inputSamples * ratio);
-    const outputBuffer = Buffer.alloc(outputSamples * 2);
-
-    for (let i = 0; i < outputSamples; i++) {
-        const inputIndexFloat = i / ratio;
-        const inputIndex1 = Math.floor(inputIndexFloat);
-        const inputIndex2 = Math.min(inputSamples - 1, inputIndex1 + 1);
-        const fraction = inputIndexFloat - inputIndex1;
-
-        const sample1 = inputBuffer.readInt16LE(inputIndex1 * 2);
-        const sample2 = inputBuffer.readInt16LE(inputIndex2 * 2);
-
-        const resampledValue = sample1 + (sample2 - sample1) * fraction;
-        outputBuffer.writeInt16LE(Math.round(resampledValue), i * 2);
-    }
-
-    return outputBuffer;
-}
-
-// --- Volume-Based VAD Function ---
-function isSilence(audioBuffer, threshold) {
-    // ... (isSilence function remains unchanged) ...
-    for (let i = 0; i < audioBuffer.length; i += 2) {
-        const sample = audioBuffer.readInt16LE(i);
-        if (Math.abs(sample) > threshold) return false;
-    }
-    return true;
-}
-
-// --- Agent System Prompt ---
-// --- Agent System Prompt ---
-const SYSTEM_INSTRUCTIONS = `# PERSONALITY & ROLE
+// --- Mutable Runtime Config (editable via /api/config) ---
+const config = {
+    model: 'gpt-4o-realtime-preview',
+    voice: 'verse',
+    // How long OpenAI server VAD waits after speech ends before triggering a response
+    silenceTimeoutMs: 500,
+    // Server VAD sensitivity: 0.0 (very sensitive) → 1.0 (only loud speech)
+    vadThreshold: 0.5,
+    systemInstructions: `# PERSONALITY & ROLE
 You are a warm, patient, and encouraging learning assistant. You speak Hinglish (mix of Hindi and English).
 Your name is Monika. You are calling for the Saajha Worksheet practice.
 
@@ -88,30 +60,126 @@ Your name is Monika. You are calling for the Saajha Worksheet practice.
 - Do NOT rush through questions
 - Do NOT talk over the child
 - WAIT for complete answers before responding
-- Keep it conversational and friendly`;
+- Keep it conversational and friendly`
+};
 
-// ----------------- Server -----------------
-const server = http.createServer();
+// --- Audio Resampling (Linear Interpolation) ---
+function resampleAudioChunk(inputBuffer, inputSampleRate, outputSampleRate) {
+    if (inputSampleRate === outputSampleRate) return inputBuffer;
+
+    const ratio = outputSampleRate / inputSampleRate;
+    const inputSamples = inputBuffer.length / 2;
+    const outputSamples = Math.floor(inputSamples * ratio);
+    const outputBuffer = Buffer.alloc(outputSamples * 2);
+
+    for (let i = 0; i < outputSamples; i++) {
+        const inputIndexFloat = i / ratio;
+        const inputIndex1 = Math.floor(inputIndexFloat);
+        const inputIndex2 = Math.min(inputSamples - 1, inputIndex1 + 1);
+        const fraction = inputIndexFloat - inputIndex1;
+
+        const sample1 = inputBuffer.readInt16LE(inputIndex1 * 2);
+        const sample2 = inputBuffer.readInt16LE(inputIndex2 * 2);
+
+        outputBuffer.writeInt16LE(Math.round(sample1 + (sample2 - sample1) * fraction), i * 2);
+    }
+
+    return outputBuffer;
+}
+
+// ----------------- HTTP + WebSocket Server -----------------
+const server = http.createServer((req, res) => {
+    if (req.method === 'GET' && req.url === '/') {
+        fs.readFile(path.join(__dirname, 'index.html'), (err, data) => {
+            if (err) { res.writeHead(404); res.end('Not found'); return; }
+            res.writeHead(200, { 'Content-Type': 'text/html' });
+            res.end(data);
+        });
+        return;
+    }
+
+    if (req.method === 'GET' && req.url === '/api/config') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(config));
+        return;
+    }
+
+    if (req.method === 'POST' && req.url === '/api/config') {
+        let body = '';
+        req.on('data', chunk => body += chunk);
+        req.on('end', () => {
+            try {
+                const updates = JSON.parse(body);
+                if (updates.silenceTimeoutMs !== undefined) config.silenceTimeoutMs = Number(updates.silenceTimeoutMs);
+                if (updates.vadThreshold !== undefined) config.vadThreshold = Number(updates.vadThreshold);
+                if (updates.model !== undefined) config.model = updates.model;
+                if (updates.voice !== undefined) config.voice = updates.voice;
+                if (updates.systemInstructions !== undefined) config.systemInstructions = updates.systemInstructions;
+                console.log('⚙️  Config updated:', {
+                    model: config.model, voice: config.voice,
+                    silenceTimeoutMs: config.silenceTimeoutMs, vadThreshold: config.vadThreshold
+                });
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify(config));
+            } catch (e) {
+                res.writeHead(400);
+                res.end(JSON.stringify({ error: 'Invalid JSON' }));
+            }
+        });
+        return;
+    }
+
+    res.writeHead(404);
+    res.end('Not found');
+});
+
 const wss = new WebSocket.Server({ server });
 
 wss.on('connection', (exotelWs) => {
     console.log('📞 Exotel connected!');
 
-    let silenceTimer = null;
-    let isUserSpeaking = false;
+    // Snapshot config at connection time — mid-call changes won't disrupt this call
+    const callConfig = { ...config };
+
     let activeResponse = false;
     let queuedChunks = [];
     let initialGreetingSent = false;
-    let lastUserTranscript = null;
 
-    // Initialize history with the System Prompt
-    const conversationHistory = [{
-        role: 'system',
-        content: SYSTEM_INSTRUCTIONS
-    }];
+    // Output audio batch buffer — accumulate before sending to Exotel
+    let outBuffer = [];
+    let outBufferSize = 0;
 
+    // ---- Output audio helpers ----
+    function flushOutBuffer(force = false) {
+        if (outBufferSize === 0) return;
+        if (!force && outBufferSize < MIN_OUT_BYTES) return;
+        const combined = Buffer.concat(outBuffer);
+        outBuffer = [];
+        outBufferSize = 0;
+        if (exotelWs.readyState === WebSocket.OPEN) {
+            exotelWs.send(JSON.stringify({
+                event: 'media',
+                media: { payload: combined.toString('base64'), format: 'pcm16', sample_rate: EXOTEL_SAMPLE_RATE }
+            }));
+        }
+    }
+
+    function discardOutBuffer() {
+        outBuffer = [];
+        outBufferSize = 0;
+    }
+
+    function cancelActiveResponse() {
+        if (activeResponse && openAIWs.readyState === WebSocket.OPEN) {
+            openAIWs.send(JSON.stringify({ type: 'response.cancel' }));
+        }
+        activeResponse = false;
+        discardOutBuffer();
+    }
+
+    // ---- OpenAI Realtime connection ----
     const openAIWs = new WebSocket(
-        'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview',
+        `wss://api.openai.com/v1/realtime?model=${callConfig.model}`,
         {
             headers: {
                 'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`,
@@ -120,117 +188,62 @@ wss.on('connection', (exotelWs) => {
         }
     );
 
-    openAIWs.bytesAppended = 0;
-
     openAIWs.on('open', () => {
-        console.log('✅ Connected to OpenAI Realtime API');
-        
-        // ** FIX APPLIED: Removed the conflicting 'session: { instructions: ... }' block **
-        openAIWs.send(JSON.stringify({ 
+        console.log(`✅ OpenAI connected (model: ${callConfig.model}, voice: ${callConfig.voice})`);
+
+        // Enable server-side VAD — OpenAI detects speech/silence far more accurately
+        // than an amplitude threshold, avoiding false interruptions during AI speech.
+        openAIWs.send(JSON.stringify({
             type: 'session.update',
-            //audio_format: { 
-            //    type: AUDIO_TYPE,
-            //    rate: OPENAI_SAMPLE_RATE 
-            //},
             session: {
-                //type: "realtime",
-                instructions: SYSTEM_INSTRUCTIONS
+                instructions: callConfig.systemInstructions,
+                voice: callConfig.voice,
+                input_audio_format: 'pcm16',
+                output_audio_format: 'pcm16',
+                turn_detection: {
+                    type: 'server_vad',
+                    threshold: callConfig.vadThreshold,
+                    prefix_padding_ms: 300,
+                    silence_duration_ms: callConfig.silenceTimeoutMs
+                }
             }
         }));
 
-        // Flush queued audio chunks
+        // Flush any audio that arrived before the connection was ready
         queuedChunks.forEach(chunk => {
-            openAIWs.send(JSON.stringify({
-                type: 'input_audio_buffer.append',
-                audio: chunk.toString('base64')
-            }));
-            openAIWs.bytesAppended += chunk.length;
+            openAIWs.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: chunk.toString('base64') }));
         });
         queuedChunks = [];
     });
 
-    openAIWs.on('error', (err) => {
-        console.error('*** OPENAI WS ERROR:', err.message);
-    });
+    openAIWs.on('error', (err) => console.error('*** OPENAI WS ERROR:', err.message));
 
     openAIWs.on('close', () => {
         console.log('❌ OpenAI disconnected');
         if (exotelWs.readyState === WebSocket.OPEN) exotelWs.close();
     });
 
+    // ---- Exotel → OpenAI ----
     exotelWs.on('message', (message) => {
         const data = JSON.parse(message.toString());
 
         if (data.event === 'media') {
             const audioChunk = Buffer.from(data.media.payload, 'base64');
-            const resampledChunk = resampleAudioChunk(
-                audioChunk,
-                EXOTEL_SAMPLE_RATE,
-                OPENAI_SAMPLE_RATE
-            );
+            const resampled = resampleAudioChunk(audioChunk, EXOTEL_SAMPLE_RATE, OPENAI_SAMPLE_RATE);
 
             if (openAIWs.readyState === WebSocket.OPEN) {
-                openAIWs.send(JSON.stringify({
-                    type: 'input_audio_buffer.append',
-                    audio: resampledChunk.toString('base64')
-                }));
-                openAIWs.bytesAppended += resampledChunk.length;
+                openAIWs.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: resampled.toString('base64') }));
             } else {
-                queuedChunks.push(resampledChunk);
+                queuedChunks.push(resampled);
             }
 
-            // --- VAD Logic ---
-            const speaking = !isSilence(audioChunk, SILENCE_THRESHOLD);
-            if (speaking) {
-                //if (!isUserSpeaking) //console.log('🎙️ User started speaking, interrupting AI...');
-                isUserSpeaking = true;
-
-                if (activeResponse) {
-                    openAIWs.send(JSON.stringify({ type: 'response.cancel' }));
-                    activeResponse = false;
-                }
-
-                if (silenceTimer) clearTimeout(silenceTimer);
-            } else {
-                if (isUserSpeaking) {
-                    silenceTimer = setTimeout(() => {
-                        //console.log('🤫 User silent → AI responds');
-
-                        if (!activeResponse && openAIWs.bytesAppended > (OPENAI_SAMPLE_RATE * 0.1 * 2)) {
-                            
-                            openAIWs.send(JSON.stringify({ type: 'input_audio_buffer.commit' }));
-
-                            // Send the FULL conversation history (including the system role)
-                            openAIWs.send(JSON.stringify({ 
-                                type: 'response.create', 
-                                //messages: conversationHistory, 
-                                response: { modalities: ['audio', 'text']  },
-                                audio: {
-            voice: "verse",   // any supported voice
-            speed: 4,       // 1.0 = normal, 1.5 = 50% faster
-        },
-        instructions: "Speak fluently and quickly, like a friendly narrator."
-                            }));
-                            
-                            activeResponse = true;
-                            openAIWs.bytesAppended = 0;
-                        }
-                        isUserSpeaking = false;
-                        silenceTimer = null;
-                    }, SILENCE_TIMEOUT_MS);
-                }
-            }
         } else if (data.event === 'start') {
-            console.log('📡 Stream started for call:', data.start.stream_sid);
-            
-            // Initiate the first response (The GREETING)
+            console.log('📡 Stream started:', data.start.stream_sid);
+
+            // Trigger the initial greeting — no user audio needed, just ask for a response
             if (!initialGreetingSent && openAIWs.readyState === WebSocket.OPEN) {
-                openAIWs.send(JSON.stringify({ type: 'input_audio_buffer.commit' })); 
-                
-                // Send response.create with the system prompt to trigger the initial greeting
-                openAIWs.send(JSON.stringify({ 
-                    type: 'response.create', 
-                    messages: conversationHistory,
+                openAIWs.send(JSON.stringify({
+                    type: 'response.create',
                     response: { modalities: ['audio', 'text'] }
                 }));
                 activeResponse = true;
@@ -239,72 +252,61 @@ wss.on('connection', (exotelWs) => {
         }
     });
 
+    // ---- OpenAI → Exotel ----
     openAIWs.on('message', (message) => {
         let data;
-        const messageStr = Buffer.isBuffer(message) ? message.toString() : message;
-
         try {
-            data = JSON.parse(messageStr);
+            data = JSON.parse(Buffer.isBuffer(message) ? message.toString() : message);
         } catch (e) {
             console.error('*** OPENAI PARSE ERROR:', e);
             return;
         }
 
+        // User started speaking → barge-in: cancel AI response immediately
+        if (data.type === 'input_audio_buffer.speech_started') {
+            console.log('🎙️  User speaking — barge-in');
+            cancelActiveResponse();
+        }
+
+        // AI response started
+        if (data.type === 'response.created') {
+            activeResponse = true;
+        }
+
+        // Stream audio delta: resample and batch before sending to Exotel
         if (data.type === 'response.audio.delta' && data.delta) {
             const chunk = Buffer.from(data.delta, 'base64');
-            if (exotelWs.readyState === WebSocket.OPEN) {
-                const resampledChunk = resampleAudioChunk(chunk, OPENAI_SAMPLE_RATE, EXOTEL_SAMPLE_RATE);
-                exotelWs.send(JSON.stringify({
-                    event: 'media',
-                    media: {
-                        payload: resampledChunk.toString('base64'),
-                        format: 'pcm16',
-                        sample_rate: EXOTEL_SAMPLE_RATE
-                    }
-                }));
-            }
+            const resampled = resampleAudioChunk(chunk, OPENAI_SAMPLE_RATE, EXOTEL_SAMPLE_RATE);
+            outBuffer.push(resampled);
+            outBufferSize += resampled.length;
+            flushOutBuffer(); // sends only when MIN_OUT_BYTES accumulated
         }
 
-        if (data.type === 'response.transcript') {
-            if (data.role === 'user' && data.text) {
-                 lastUserTranscript = data.text;
-                 //console.log(`[USER]: ${data.text}`);
-            }
-        }
-
+        // Response audio finished — flush any remaining buffered audio
         if (data.type === 'response.audio.done') {
+            flushOutBuffer(true);
             activeResponse = false;
         }
 
         if (data.type === 'response.done') {
-            // Update history with the user's input and AI's response after a turn
-            if (lastUserTranscript) {
-                conversationHistory.push({ role: 'user', content: lastUserTranscript });
-                lastUserTranscript = null;
-            }
-            
-            if (data.text) {
-                conversationHistory.push({ role: 'assistant', content: data.text });
-                //console.log(`[AI TEXT]: ${data.text}`);
-            }
             activeResponse = false;
-            //console.log('🗣️ OpenAI finished speaking');
         }
 
         if (data.type === 'error') {
             console.error('*** OPENAI ERROR:', data.error?.message);
             activeResponse = false;
+            discardOutBuffer();
         }
     });
 
     exotelWs.on('close', () => {
         console.log('❌ Exotel disconnected, cleaning up');
-        if (silenceTimer) clearTimeout(silenceTimer);
         openAIWs.close();
     });
 });
 
 server.listen(8080, () => {
-    console.log('🚀 Exotel WebSocket Server running on port 8080');
-    console.log('Waiting for connection at ws://YOUR_SERVER_IP:8080');
+    console.log('🚀 Server running on port 8080');
+    console.log('   WebSocket: ws://YOUR_SERVER_IP:8080');
+    console.log('   Config UI: http://YOUR_SERVER_IP:8080');
 });
