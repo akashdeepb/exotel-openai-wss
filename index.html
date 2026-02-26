@@ -55,46 +55,34 @@
         </div>
     </div>
 
-    <!-- VAD + Response Settings -->
+    <!-- VAD Settings -->
     <div class="card mb-3">
-        <div class="card-header py-3">Listening &amp; Response</div>
+        <div class="card-header py-3">Listening &amp; VAD</div>
         <div class="card-body">
             <div class="row g-4">
-                <div class="col-md-4">
+                <div class="col-md-6">
                     <label class="form-label fw-semibold d-flex justify-content-between">
                         Silence Timeout
                         <span><span class="range-val" id="silenceTimeoutVal">900</span> ms</span>
                     </label>
                     <input type="range" class="form-range" id="silenceTimeoutMs" min="300" max="3000" step="50">
                     <div class="d-flex justify-content-between">
-                        <small class="text-muted">300 ms</small>
-                        <small class="text-muted">3000 ms</small>
+                        <small class="text-muted">300 ms (snappy)</small>
+                        <small class="text-muted">3000 ms (patient)</small>
                     </div>
-                    <div class="form-text">How long AI waits after user stops speaking before responding. Children need more time — try 800–1200 ms.</div>
+                    <div class="form-text">How long of silence before AI responds. Use 800–1200 ms for children.</div>
                 </div>
-                <div class="col-md-4">
+                <div class="col-md-6">
                     <label class="form-label fw-semibold d-flex justify-content-between">
                         VAD Sensitivity
                         <span><span class="range-val" id="vadThresholdVal">0.30</span></span>
                     </label>
                     <input type="range" class="form-range" id="vadThreshold" min="0.1" max="0.9" step="0.05">
                     <div class="d-flex justify-content-between">
-                        <small class="text-muted">0.1 sensitive</small>
-                        <small class="text-muted">0.9 loud</small>
+                        <small class="text-muted">0.1 (very sensitive)</small>
+                        <small class="text-muted">0.9 (loud only)</small>
                     </div>
                     <div class="form-text">Lower = picks up quieter voices. Recommended 0.3 for children.</div>
-                </div>
-                <div class="col-md-4">
-                    <label class="form-label fw-semibold d-flex justify-content-between">
-                        Max Response Tokens
-                        <span><span class="range-val" id="maxResponseTokensVal">80</span></span>
-                    </label>
-                    <input type="range" class="form-range" id="maxResponseTokens" min="20" max="400" step="10">
-                    <div class="d-flex justify-content-between">
-                        <small class="text-muted">20 (very short)</small>
-                        <small class="text-muted">400 (long)</small>
-                    </div>
-                    <div class="form-text">Hard cap on response length. 80 ≈ 1–2 sentences. Prevents rambling.</div>
                 </div>
             </div>
         </div>
@@ -135,8 +123,6 @@
         $('#silenceTimeoutVal').text(cfg.silenceTimeoutMs);
         $('#vadThreshold').val(cfg.vadThreshold);
         $('#vadThresholdVal').text(Number(cfg.vadThreshold).toFixed(2));
-        $('#maxResponseTokens').val(cfg.maxResponseTokens);
-        $('#maxResponseTokensVal').text(cfg.maxResponseTokens);
         $('#systemInstructions').val(cfg.systemInstructions);
     }
 
@@ -153,17 +139,12 @@
         $('#vadThresholdVal').text(Number($(this).val()).toFixed(2));
     });
 
-    $('#maxResponseTokens').on('input', function () {
-        $('#maxResponseTokensVal').text($(this).val());
-    });
-
     $('#saveBtn').on('click', function () {
         const payload = {
             model: $('#model').val(),
             voice: $('#voice').val(),
             silenceTimeoutMs: parseInt($('#silenceTimeoutMs').val()),
             vadThreshold: parseFloat($('#vadThreshold').val()),
-            maxResponseTokens: parseInt($('#maxResponseTokens').val()),
             systemInstructions: $('#systemInstructions').val()
         };
 
