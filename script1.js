@@ -8,59 +8,52 @@ require('dotenv').config();
 const EXOTEL_SAMPLE_RATE = 8000;
 const OPENAI_SAMPLE_RATE = 24000;
 
-// Minimum bytes to accumulate before flushing output audio to Exotel.
-// At 8kHz PCM16: 640 bytes ≈ 40ms. Keeps delivery smooth without adding felt latency.
+// ~40ms of audio at 8kHz before flushing to Exotel — smooth delivery without felt latency
 const MIN_OUT_BYTES = 640;
+
+// How long to keep input muted after AI finishes speaking, to let phone echo die out.
+// Phone speaker → mic echo typically settles within 600–800ms on Indian mobile networks.
+const ECHO_GATE_MS = 800;
 
 // --- Mutable Runtime Config (editable via /api/config) ---
 const config = {
     model: 'gpt-4o-realtime-preview',
-    voice: 'verse',
-    // How long OpenAI server VAD waits after speech ends before triggering a response
-    silenceTimeoutMs: 500,
-    // Server VAD sensitivity: 0.0 (very sensitive) → 1.0 (only loud speech)
-    vadThreshold: 0.5,
-    systemInstructions: `# PERSONALITY & ROLE
-You are a warm, patient, and encouraging learning assistant. You speak Hinglish (mix of Hindi and English).
-Your name is Monika. You are calling for the Saajha Worksheet practice.
+    voice: 'shimmer',          // warm, clear voice — works well for children
+    silenceTimeoutMs: 900,     // ms of silence before AI responds — children need more time to think
+    vadThreshold: 0.3,         // lower = catches quieter children's voices (0.0–1.0)
+    maxResponseTokens: 80,     // hard cap: forces 1–2 sentence responses, prevents rambling
+    systemInstructions: `You are Monika, a warm and patient teaching assistant calling from Saajha NGO in India. You speak natural Hinglish (Hindi + English mixed, like everyday Indian conversation).
 
-# YOUR TASKS
-1. You are on a call with a parent. Follow the instructions carefully and don't move to the next question unless you have a clear answer.
-2. Shift control to the child and ask them to create and verbally explain their own study plan.
-3. The child must articulate the plan out loud. Only once you clearly have the plan, move to the next step.
-4. Guide the child through the following questions. Ask each question up to 3 times if they get it wrong.
-5. Ask the child first question: "What is 5+2?"
-6. Wait for the child to give answer.
-7. If the child doesn't say 7, teach them how 5+2 equals 7.
-8. Ask the child second question: "What is 7+5?"
-9. Wait for the child to give answer.
-10. If the child doesn't say 12, teach them how 7+5 equals 12.
-11. Ask the child third question: "What is 7-5?"
-12. Wait for the child to give answer.
-13. If the child doesn't say 2, teach them how 7-2 equals 22.
-14. Ask the child fourth question: "What is 12-5?"
-15. Wait for the child to give answer.
-16. If the child doesn't say 7, teach them how 12-5 equals 7.
-17. Ask the child fifth question: "What is 5 * 2?"
-18. Wait for the child to give answer.
-19. If the child doesn't say 10, teach them how 5 * 2 equals 10.
-20. After completion of the questions, say thank for your time and you will contact again meanwhile they should stick to their prepared study plan
+YOUR MOST IMPORTANT RULE: Say ONE short thing (1–2 sentences maximum), then STOP and wait silently for a response. Never say two things in a row without hearing a reply first. Never move to the next topic without getting an answer.
 
-# CONVERSATION STYLE
-- Keep each response SHORT - maximum 1-2 sentences
-- Speak at a NORMAL pace, not too fast
-- WAIT for the child to answer before moving on
-- Give children time to think (at least 20-30 seconds)
-- Be extremely encouraging: "Shabash!", "Bahut achha!", "Very good!", "You are smart!"
-- Ask ONE question at a time
-- Confirm understanding before proceeding
-- Be patient - children need time to process and answer
+CALL FLOW — cover each step in order, waiting for a reply before moving on:
 
-# CRITICAL RULES
-- Do NOT rush through questions
-- Do NOT talk over the child
-- WAIT for complete answers before responding
-- Keep it conversational and friendly`
+Step 1: Greet the parent warmly. Ask how they are. Then stop and wait.
+Step 2: Tell them you are calling from Saajha for some fun practice with the child. Ask if the child can come to the phone. Then stop and wait.
+Step 3: Greet the child cheerfully. Ask their name. Then stop and wait.
+Step 4: Ask the child to tell you their study plan for today in one or two sentences. Then stop and wait.
+Step 5: Praise their plan warmly. Say "Chalo, ab thoda maths karte hain!" Then stop and wait.
+Step 6: Ask the math questions below, one at a time. After each question, stop completely and wait for the child's answer before saying anything else.
+
+MATH QUESTIONS (ask exactly one, then wait):
+Q1: "Batao — 5 aur 2 kitne hote hain?" (correct answer: 7)
+Q2: "Ab batao — 7 aur 5 kitne hote hain?" (correct answer: 12)
+Q3: "7 mein se 5 ghatao toh kya bachega?" (correct answer: 2)
+Q4: "12 mein se 5 ghatao?" (correct answer: 7)
+Q5: "5 ka 2 se multiply karo toh kya aata hai?" (correct answer: 10)
+
+For each answer:
+- Correct: say "Shabash! Bilkul sahi!" and move to the next question.
+- Wrong: gently say the correct answer with a simple example, then ask them to try again (maximum 3 attempts per question).
+- No answer or long silence: say "Koi baat nahi, time lo. Sochte sochte batao!"
+
+Step 7: After all five questions, praise the child warmly. Remind them to stick to their study plan. Say a warm goodbye.
+
+ALWAYS:
+- 1–2 sentences per response. Stop after that.
+- Be warm, patient, and encouraging.
+- Never rush or list multiple things at once.
+- Wait. The child needs time to think.`
 };
 
 // --- Audio Resampling (Linear Interpolation) ---
@@ -77,17 +70,15 @@ function resampleAudioChunk(inputBuffer, inputSampleRate, outputSampleRate) {
         const inputIndex1 = Math.floor(inputIndexFloat);
         const inputIndex2 = Math.min(inputSamples - 1, inputIndex1 + 1);
         const fraction = inputIndexFloat - inputIndex1;
-
         const sample1 = inputBuffer.readInt16LE(inputIndex1 * 2);
         const sample2 = inputBuffer.readInt16LE(inputIndex2 * 2);
-
         outputBuffer.writeInt16LE(Math.round(sample1 + (sample2 - sample1) * fraction), i * 2);
     }
 
     return outputBuffer;
 }
 
-// ----------------- HTTP + WebSocket Server -----------------
+// ----------------- HTTP Server (Config UI + API) -----------------
 const server = http.createServer((req, res) => {
     if (req.method === 'GET' && req.url === '/') {
         fs.readFile(path.join(__dirname, 'index.html'), (err, data) => {
@@ -109,15 +100,18 @@ const server = http.createServer((req, res) => {
         req.on('data', chunk => body += chunk);
         req.on('end', () => {
             try {
-                const updates = JSON.parse(body);
-                if (updates.silenceTimeoutMs !== undefined) config.silenceTimeoutMs = Number(updates.silenceTimeoutMs);
-                if (updates.vadThreshold !== undefined) config.vadThreshold = Number(updates.vadThreshold);
-                if (updates.model !== undefined) config.model = updates.model;
-                if (updates.voice !== undefined) config.voice = updates.voice;
-                if (updates.systemInstructions !== undefined) config.systemInstructions = updates.systemInstructions;
+                const u = JSON.parse(body);
+                if (u.silenceTimeoutMs !== undefined)  config.silenceTimeoutMs  = Number(u.silenceTimeoutMs);
+                if (u.vadThreshold !== undefined)       config.vadThreshold       = Number(u.vadThreshold);
+                if (u.maxResponseTokens !== undefined)  config.maxResponseTokens  = Number(u.maxResponseTokens);
+                if (u.model !== undefined)              config.model              = u.model;
+                if (u.voice !== undefined)              config.voice              = u.voice;
+                if (u.systemInstructions !== undefined) config.systemInstructions = u.systemInstructions;
                 console.log('⚙️  Config updated:', {
                     model: config.model, voice: config.voice,
-                    silenceTimeoutMs: config.silenceTimeoutMs, vadThreshold: config.vadThreshold
+                    silenceTimeoutMs: config.silenceTimeoutMs,
+                    vadThreshold: config.vadThreshold,
+                    maxResponseTokens: config.maxResponseTokens
                 });
                 res.writeHead(200, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify(config));
@@ -133,28 +127,40 @@ const server = http.createServer((req, res) => {
     res.end('Not found');
 });
 
+// ----------------- WebSocket Server -----------------
 const wss = new WebSocket.Server({ server });
 
 wss.on('connection', (exotelWs) => {
-    console.log('📞 Exotel connected!');
+    console.log('📞 Exotel connected');
 
-    // Snapshot config at connection time — mid-call changes won't disrupt this call
+    // Snapshot config at connection time so mid-call UI changes don't disrupt this call
     const callConfig = { ...config };
 
     let activeResponse = false;
-    let queuedChunks = [];
+    let queuedChunks   = [];
+
+    // Input gate: while true, Exotel audio is NOT forwarded to OpenAI.
+    // Purpose: prevent the AI's own audio (played through the phone speaker) from
+    // being picked up by the mic, sent back, and triggering a new response (echo loop).
+    let inputGated    = true;  // start gated — opens only after session is configured
+    let echoGateTimer = null;
+
+    // Track whether both sides are ready before triggering the greeting
+    let streamSid          = null;
+    let sessionConfigured  = false;
     let initialGreetingSent = false;
 
-    // Output audio batch buffer — accumulate before sending to Exotel
-    let outBuffer = [];
+    // Output audio batch buffer
+    let outBuffer     = [];
     let outBufferSize = 0;
 
-    // ---- Output audio helpers ----
+    // ---- Helpers ----
+
     function flushOutBuffer(force = false) {
         if (outBufferSize === 0) return;
         if (!force && outBufferSize < MIN_OUT_BYTES) return;
         const combined = Buffer.concat(outBuffer);
-        outBuffer = [];
+        outBuffer     = [];
         outBufferSize = 0;
         if (exotelWs.readyState === WebSocket.OPEN) {
             exotelWs.send(JSON.stringify({
@@ -165,16 +171,56 @@ wss.on('connection', (exotelWs) => {
     }
 
     function discardOutBuffer() {
-        outBuffer = [];
+        outBuffer     = [];
         outBufferSize = 0;
     }
 
+    // Close the input gate immediately (blocks Exotel audio from reaching OpenAI)
+    function closeInputGate() {
+        if (echoGateTimer) { clearTimeout(echoGateTimer); echoGateTimer = null; }
+        inputGated = true;
+    }
+
+    // Schedule the input gate to open after ECHO_GATE_MS (lets phone echo die out)
+    function scheduleOpenInputGate() {
+        if (echoGateTimer) clearTimeout(echoGateTimer);
+        echoGateTimer = setTimeout(() => {
+            inputGated    = false;
+            echoGateTimer = null;
+            console.log('🎤 Listening for user');
+        }, ECHO_GATE_MS);
+    }
+
+    // Cancel the current AI response and clean up state.
+    // Sends input_audio_buffer.clear so the dirty echo-contaminated buffer
+    // doesn't get transcribed and confuse the next turn.
     function cancelActiveResponse() {
         if (activeResponse && openAIWs.readyState === WebSocket.OPEN) {
             openAIWs.send(JSON.stringify({ type: 'response.cancel' }));
+            openAIWs.send(JSON.stringify({ type: 'input_audio_buffer.clear' }));
         }
         activeResponse = false;
         discardOutBuffer();
+    }
+
+    // Trigger the initial greeting once both the Exotel stream AND the OpenAI
+    // session.updated acknowledgement have arrived — avoids the race where
+    // response.create fires before the session is fully configured.
+    function tryTriggerGreeting() {
+        if (!streamSid || !sessionConfigured || initialGreetingSent) return;
+        if (openAIWs.readyState !== WebSocket.OPEN) return;
+
+        console.log('👋 Triggering greeting');
+        closeInputGate();
+        openAIWs.send(JSON.stringify({
+            type: 'response.create',
+            response: {
+                modalities: ['audio', 'text'],
+                max_response_output_tokens: callConfig.maxResponseTokens
+            }
+        }));
+        initialGreetingSent = true;
+        activeResponse = true;
     }
 
     // ---- OpenAI Realtime connection ----
@@ -191,8 +237,6 @@ wss.on('connection', (exotelWs) => {
     openAIWs.on('open', () => {
         console.log(`✅ OpenAI connected (model: ${callConfig.model}, voice: ${callConfig.voice})`);
 
-        // Enable server-side VAD — OpenAI detects speech/silence far more accurately
-        // than an amplitude threshold, avoiding false interruptions during AI speech.
         openAIWs.send(JSON.stringify({
             type: 'session.update',
             session: {
@@ -200,20 +244,26 @@ wss.on('connection', (exotelWs) => {
                 voice: callConfig.voice,
                 input_audio_format: 'pcm16',
                 output_audio_format: 'pcm16',
+                modalities: ['audio', 'text'],
+                temperature: 0.7,
+                max_response_output_tokens: callConfig.maxResponseTokens,
                 turn_detection: {
                     type: 'server_vad',
                     threshold: callConfig.vadThreshold,
                     prefix_padding_ms: 300,
-                    silence_duration_ms: callConfig.silenceTimeoutMs
+                    silence_duration_ms: callConfig.silenceTimeoutMs,
+                    create_response: true
                 }
             }
         }));
 
-        // Flush any audio that arrived before the connection was ready
-        queuedChunks.forEach(chunk => {
-            openAIWs.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: chunk.toString('base64') }));
-        });
-        queuedChunks = [];
+        // Flush any audio chunks that arrived before the connection was ready
+        if (queuedChunks.length > 0) {
+            queuedChunks.forEach(chunk => {
+                openAIWs.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: chunk.toString('base64') }));
+            });
+            queuedChunks = [];
+        }
     });
 
     openAIWs.on('error', (err) => console.error('*** OPENAI WS ERROR:', err.message));
@@ -223,13 +273,19 @@ wss.on('connection', (exotelWs) => {
         if (exotelWs.readyState === WebSocket.OPEN) exotelWs.close();
     });
 
-    // ---- Exotel → OpenAI ----
+    // ---- Exotel → OpenAI (incoming call audio) ----
     exotelWs.on('message', (message) => {
         const data = JSON.parse(message.toString());
 
         if (data.event === 'media') {
+            // Gate: drop audio while AI is speaking to break the echo feedback loop.
+            // Without this, the AI's voice played through the phone speaker gets picked
+            // up by the mic, sent back as user audio, and triggers another response —
+            // making the AI talk to itself in an infinite loop.
+            if (inputGated) return;
+
             const audioChunk = Buffer.from(data.media.payload, 'base64');
-            const resampled = resampleAudioChunk(audioChunk, EXOTEL_SAMPLE_RATE, OPENAI_SAMPLE_RATE);
+            const resampled  = resampleAudioChunk(audioChunk, EXOTEL_SAMPLE_RATE, OPENAI_SAMPLE_RATE);
 
             if (openAIWs.readyState === WebSocket.OPEN) {
                 openAIWs.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: resampled.toString('base64') }));
@@ -238,21 +294,16 @@ wss.on('connection', (exotelWs) => {
             }
 
         } else if (data.event === 'start') {
-            console.log('📡 Stream started:', data.start.stream_sid);
+            streamSid = data.start.stream_sid;
+            console.log('📡 Stream started:', streamSid);
+            tryTriggerGreeting();
 
-            // Trigger the initial greeting — no user audio needed, just ask for a response
-            if (!initialGreetingSent && openAIWs.readyState === WebSocket.OPEN) {
-                openAIWs.send(JSON.stringify({
-                    type: 'response.create',
-                    response: { modalities: ['audio', 'text'] }
-                }));
-                activeResponse = true;
-                initialGreetingSent = true;
-            }
+        } else if (data.event === 'stop') {
+            console.log('📵 Stream stopped');
         }
     });
 
-    // ---- OpenAI → Exotel ----
+    // ---- OpenAI → Exotel (AI responses) ----
     openAIWs.on('message', (message) => {
         let data;
         try {
@@ -262,46 +313,68 @@ wss.on('connection', (exotelWs) => {
             return;
         }
 
-        // User started speaking → barge-in: cancel AI response immediately
-        if (data.type === 'input_audio_buffer.speech_started') {
-            console.log('🎙️  User speaking — barge-in');
-            cancelActiveResponse();
+        // Session is fully configured — safe to trigger the greeting now
+        if (data.type === 'session.updated') {
+            sessionConfigured = true;
+            tryTriggerGreeting();
         }
 
-        // AI response started
+        // AI response started — gate input to prevent echo from triggering another response
         if (data.type === 'response.created') {
             activeResponse = true;
+            closeInputGate();
         }
 
-        // Stream audio delta: resample and batch before sending to Exotel
+        // User started speaking while AI is responding (barge-in).
+        // With input gating this should rarely fire mid-response — mainly a safety net
+        // for the window between gate opening and the next response starting.
+        if (data.type === 'input_audio_buffer.speech_started') {
+            console.log('🎙️  User speaking');
+            if (activeResponse) {
+                cancelActiveResponse();
+            }
+        }
+
+        // Stream AI audio to Exotel — batched for smooth delivery
         if (data.type === 'response.audio.delta' && data.delta) {
-            const chunk = Buffer.from(data.delta, 'base64');
+            const chunk    = Buffer.from(data.delta, 'base64');
             const resampled = resampleAudioChunk(chunk, OPENAI_SAMPLE_RATE, EXOTEL_SAMPLE_RATE);
             outBuffer.push(resampled);
             outBufferSize += resampled.length;
             flushOutBuffer(); // sends only when MIN_OUT_BYTES accumulated
         }
 
-        // Response audio finished — flush any remaining buffered audio
+        // AI finished speaking — flush remaining audio, then open input gate after echo settles
         if (data.type === 'response.audio.done') {
             flushOutBuffer(true);
             activeResponse = false;
+            scheduleOpenInputGate();
         }
 
         if (data.type === 'response.done') {
             activeResponse = false;
         }
 
+        // Response was cancelled (e.g., due to barge-in) — open gate after brief cooldown
+        if (data.type === 'response.cancelled') {
+            flushOutBuffer(true);
+            activeResponse = false;
+            discardOutBuffer();
+            scheduleOpenInputGate();
+        }
+
         if (data.type === 'error') {
             console.error('*** OPENAI ERROR:', data.error?.message);
             activeResponse = false;
             discardOutBuffer();
+            scheduleOpenInputGate();
         }
     });
 
     exotelWs.on('close', () => {
         console.log('❌ Exotel disconnected, cleaning up');
-        openAIWs.close();
+        if (echoGateTimer) clearTimeout(echoGateTimer);
+        if (openAIWs.readyState === WebSocket.OPEN) openAIWs.close();
     });
 });
 
